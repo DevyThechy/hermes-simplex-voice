@@ -1,0 +1,720 @@
+--- a/plugins/platforms/simplex/adapter.py
++++ b/plugins/platforms/simplex/adapter.py
+@@ -46,16 +46,24 @@
+ 
+ import asyncio
+ import base64
++import io
+ import json
+ import logging
+ import os
+ import random
+ import re
+ import time
++import wave
+ from datetime import datetime, timezone
++from fractions import Fraction
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
++import numpy as np
++
++import av
++from aiortc.mediastreams import MediaStreamTrack, MediaStreamError
++
+ # Lazy import: BasePlatformAdapter and friends live in the main repo.
+ # Imported at module top because they're stdlib-only inside Hermes — no
+ # external dependency that would block the plugin from loading.
+@@ -81,6 +89,132 @@
+ # Correlation ID prefix for requests we send so we can ignore our own echoes.
+ _CORR_PREFIX = "hermes-"
+ 
++# Native voice call audio pipeline constants
++_CALL_SR = 16000          # STT/VAD sample rate
++_CALL_SEND_RATE = 48000   # Opus outbound sample rate
++_CALL_VAD_THRESHOLD = 0.008
++_CALL_VAD_MIN_SPEECH = 0.35
++_CALL_VAD_END_SILENCE = 0.8
++_CALL_VAD_MAX_TURN = 20.0
++_CALL_STT_URL = os.getenv(
++    "SIMPLEX_CALL_STT_URL",
++    "http://127.0.0.1:8003/v1/audio/transcriptions",
++)
++_CALL_TTS_URL = os.getenv("SIMPLEX_CALL_TTS_URL", "http://127.0.0.1:5003/tts_stream")
++_CALL_STT_MODEL = os.getenv("SIMPLEX_CALL_STT_MODEL", "Systran/faster-whisper-small")
++_CALL_LANGUAGE = os.getenv("SIMPLEX_CALL_LANGUAGE", "en")
++
++
++# ---------------------------------------------------------------------------
++# SimpleX call E2EE (FrameCryptor) — monkey-patch aiortc
++# ---------------------------------------------------------------------------
++# Encrypts/decrypts the RTP payload with AES-256-GCM, matching the official
++# SimpleX call protocol (sharedKey from the daemon's DH exchange).
++#
++# Encrypted audio payload layout (clear header = 1 byte, the Opus TOC):
++#   [clear TOC (1B)] [ciphertext (N-1B)] [tag (16B)] [iv (12B)]
++#   AES-256-GCM, random 12B IV per frame, 16B tag, empty AAD.
++#
++# The key is injected on the transport as `_simplex_e2ee_key` (32 bytes).
++# Without it the patches act as passthrough (no encryption).
++_E2EE_CLEAR_HEADER = 1
++_E2EE_IV_SIZE = 12
++_E2EE_KEY_ATTR = "_simplex_e2ee_key"
++_SIMPLEX_E2EE_READY = False
++
++
++def _simplex_decode_shared_key(value) -> Optional[bytes]:
++    """Decode the sharedKey (standard or URL-safe base64, with or without padding)."""
++    if not value or not isinstance(value, str):
++        return None
++    padded = value + "=" * (-len(value) % 4)
++    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
++        try:
++            key = decoder(padded)
++            if len(key) == 32:
++                return key
++        except Exception:
++            continue
++    return None
++
++
++def _simplex_rtp_payload_bounds(data: bytes):
++    """Start/end offsets of the RTP payload (honors CSRC/extension/padding)."""
++    b0 = data[0]
++    off = 12 + (b0 & 0x0F) * 4
++    if (b0 >> 4) & 1 and len(data) >= off + 4:
++        off += 4 + int.from_bytes(data[off + 2 : off + 4], "big") * 4
++    end = len(data)
++    if (b0 >> 5) & 1 and end > off:
++        pad = data[-1]
++        if 0 < pad <= end - off:
++            end -= pad
++    return off, end
++
++
++def _simplex_e2ee_install() -> bool:
++    """Monkey-patch aiortc to encrypt/decrypt RTP payloads. Idempotent."""
++    global _SIMPLEX_E2EE_READY
++    if _SIMPLEX_E2EE_READY:
++        return True
++    try:
++        from aiortc.rtcdtlstransport import RTCDtlsTransport
++        from aiortc.rtcrtpreceiver import RTCRtpReceiver
++        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
++
++        def _encrypt(key: bytes, payload: bytes) -> bytes:
++            iv = os.urandom(_E2EE_IV_SIZE)
++            body = payload[_E2EE_CLEAR_HEADER:]
++            return (
++                payload[:_E2EE_CLEAR_HEADER]
++                + AESGCM(key).encrypt(iv, body, None)
++                + iv
++            )
++
++        def _decrypt(key: bytes, payload: bytes) -> bytes:
++            head = payload[:_E2EE_CLEAR_HEADER]
++            rest = payload[_E2EE_CLEAR_HEADER:]
++            body = AESGCM(key).decrypt(rest[-_E2EE_IV_SIZE:], rest[:-_E2EE_IV_SIZE], None)
++            return head + body
++
++        _orig_send_rtp = RTCDtlsTransport._send_rtp
++
++        async def _send_rtp(self, data: bytes) -> None:
++            key = getattr(self, _E2EE_KEY_ATTR, None)
++            if key is not None:
++                try:
++                    off, end = _simplex_rtp_payload_bounds(data)
++                    if end > off:
++                        data = data[:off] + _encrypt(key, data[off:end]) + data[end:]
++                except Exception:
++                    logger.exception(
++                        "SimpleX call: E2EE encrypt failed (frame dropped)"
++                    )
++            await _orig_send_rtp(self, data)
++
++        _orig_handle_rtp = RTCRtpReceiver._handle_rtp_packet
++
++        async def _handle_rtp_packet(self, packet, arrival_time_ms):
++            key = getattr(self.transport, _E2EE_KEY_ATTR, None)
++            if key is not None and packet.payload:
++                try:
++                    packet.payload = _decrypt(key, packet.payload)
++                except Exception:
++                    logger.debug("SimpleX call: E2EE decrypt failed (frame dropped)")
++                    return
++            await _orig_handle_rtp(self, packet, arrival_time_ms=arrival_time_ms)
++
++        RTCDtlsTransport._send_rtp = _send_rtp
++        RTCRtpReceiver._handle_rtp_packet = _handle_rtp_packet
++        _SIMPLEX_E2EE_READY = True
++        logger.warning("SimpleX call: E2EE FrameCryptor installed on aiortc")
++        return True
++    except Exception:
++        logger.exception(
++            "SimpleX call: E2EE monkey-patch failed (unencrypted fallback)"
++        )
++        return False
++
+ 
+ # ---------------------------------------------------------------------------
+ # Helpers
+@@ -134,6 +268,49 @@
+ # SimpleX Adapter
+ # ---------------------------------------------------------------------------
+ 
++
++class _CallSendTrack(MediaStreamTrack):
++    """Outbound audio track serving TTS PCM frames to the aiortc sender."""
++
++    kind = "audio"
++
++    def __init__(self):
++        super().__init__()
++        self._queue = asyncio.Queue()
++        self._stopped = False
++        self._pts = 0
++
++    async def recv(self):
++        if self._stopped:
++            raise MediaStreamError
++        frame = await self._queue.get()
++        if frame is None:
++            raise MediaStreamError
++        return frame
++
++    def push_pcm(self, data: bytes) -> None:
++        # data: s16 mono @ 48kHz bytes
++        step = 960 * 2  # 960 samples * 2 bytes = 20 ms
++        for i in range(0, len(data) - step + 1, step):
++            chunk = data[i : i + step]
++            arr = np.frombuffer(chunk, dtype=np.int16)
++            frame = av.AudioFrame.from_ndarray(
++                arr.reshape(1, -1), format="s16", layout="mono"
++            )
++            frame.sample_rate = _CALL_SEND_RATE
++            frame.pts = self._pts
++            frame.time_base = Fraction(1, _CALL_SEND_RATE)
++            self._pts += 960
++            self._queue.put_nowait(frame)
++
++    def stop(self) -> None:
++        self._stopped = True
++        try:
++            self._queue.put_nowait(None)
++        except Exception:
++            pass
++
++
+ class SimplexAdapter(BasePlatformAdapter):
+     """SimpleX Chat adapter using the simplex-chat daemon WebSocket API.
+ 
+@@ -197,6 +374,13 @@
+         self._pending_text_batches: Dict[str, MessageEvent] = {}
+         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+ 
++        # Native call state (SimpleX native voice calls)
++        self._call_pc = None          # aiortc RTCPeerConnection
++        self._call_contact_id = None  # contact id of the active call
++        self._call_send_track = None  # _CallSendTrack for outbound audio
++        self._call_audio_task = None  # asyncio task for the audio loop
++        self._call_shared_key = None  # base64 E2EE key (None = sin cifrado)
++
+         logger.info(
+             "SimpleX adapter initialized: url=%s auto_accept=%s groups=%s",
+             self.ws_url,
+@@ -389,6 +573,11 @@
+         # into _pending_responses (e.g. fire-and-forget).
+         if corr_id and isinstance(corr_id, str) and corr_id.startswith(_CORR_PREFIX):
+             self._pending_corr_ids.discard(corr_id)
++            logger.warning(
++                "SimpleX: daemon reply for %s: %s",
++                corr_id,
++                json.dumps(resp)[:400],
++            )
+             return
+ 
+         resp_type = resp.get("type") or event.get("type", "")
+@@ -468,6 +657,20 @@
+                         )
+             return
+ 
++        # Native call events (SimpleX native voice calls)
++        if resp_type == "callInvitation":
++            await self._call_handle_invitation(resp)
++            return
++        if resp_type == "callAnswer":
++            await self._call_apply_answer(resp)
++            return
++        if resp_type == "callExtraInfo":
++            await self._call_apply_ice(resp)
++            return
++        if resp_type == "callEnded":
++            await self._call_end(resp)
++            return
++
+         if resp_type:
+             logger.debug("SimpleX: unhandled event type: %s", resp_type)
+ 
+@@ -1160,6 +1363,462 @@
+             return {"chat_id": chat_id, "type": "group", "name": chat_id[6:]}
+         return {"chat_id": chat_id, "type": "dm", "name": chat_id}
+ 
++    # ------------------------------------------------------------------
++    # Native voice calls — Fase 1 (signaling)
++    # ------------------------------------------------------------------
++
++    async def _call_handle_invitation(self, resp: dict) -> None:
++        """Incoming call invitation — the bot is CALLEE = WebRTC OFFERER.
++
++        Sends ``/_call offer`` carrying aiortc's local SDP (vanilla ICE embeds
++        all candidates). The daemon injects the DH pub key from the invite.
++        """
++        from aiortc import RTCPeerConnection
++        from lzstring import LZString
++
++        # The daemon nests the contact inside the invitation payload.
++        inv = resp.get("callInvitation") or resp.get("invitation") or {}
++        contact = inv.get("contact") or {}
++        contact_id = str(
++            contact.get("contactId")
++            or inv.get("contactId")
++            or resp.get("contactId")
++            or resp.get("contact")
++            or ""
++        )
++        logger.warning(
++            "SimpleX call: invitation from %s (event keys=%s)",
++            _redact_id(contact_id),
++            list(resp.keys()),
++        )
++
++        if self._call_pc is not None:
++            logger.warning(
++                "SimpleX call: busy — rejecting invitation from %s",
++                _redact_id(contact_id),
++            )
++            await self._send_fire_and_forget("/_call reject @%s" % contact_id)
++            return
++
++        self._call_contact_id = contact_id
++
++        # E2EE: the daemon already computed the sharedKey (X25519 DH) and injected it.
++        shared_key = inv.get("sharedKey")
++        self._call_shared_key = shared_key
++        logger.warning(
++            "SimpleX call: E2EE %s from %s (sharedKey=%s)",
++            "ENABLED" if shared_key else "disabled",
++            _redact_id(contact_id),
++            "present" if shared_key else "absent",
++        )
++
++        pc = RTCPeerConnection()
++        self._call_pc = pc
++        self._call_send_track = _CallSendTrack()
++        pc.addTrack(self._call_send_track)
++
++        # E2EE: install the key on the transport if the FrameCryptor is ready.
++        e2ee_key = _simplex_decode_shared_key(shared_key) if shared_key else None
++        if e2ee_key is not None and _simplex_e2ee_install():
++            for _sender in pc.getSenders():
++                _sender.transport._simplex_e2ee_key = e2ee_key
++            for _receiver in pc.getReceivers():
++                _receiver.transport._simplex_e2ee_key = e2ee_key
++            logger.warning("SimpleX call: E2EE media key installed on transport")
++        else:
++            e2ee_key = None
++            logger.warning("SimpleX call: E2EE media key NOT installed (unencrypted)")
++
++        @pc.on("connectionstatechange")
++        async def _on_conn_state():
++            logger.warning("SimpleX call: connection state = %s", pc.connectionState)
++
++        try:
++            offer = await pc.createOffer()
++            await pc.setLocalDescription(offer)
++            sdp = pc.localDescription.sdp
++            session = LZString.compressToBase64(
++                json.dumps({"type": "offer", "sdp": sdp})
++            )
++            payload = {
++                # E2EE: advertise True only if the media key was installed on the
++                # transport (FrameCryptor active); otherwise the call is unencrypted.
++                "callType": {"media": "audio", "capabilities": {"encryption": bool(e2ee_key)}},
++                "rtcSession": {
++                    "rtcSession": session,
++                    "rtcIceCandidates": LZString.compressToBase64("[]"),
++                },
++            }
++            cmd = "/_call offer @%s %s" % (contact_id, json.dumps(payload))
++            await self._send_fire_and_forget(cmd)
++            logger.warning(
++                "SimpleX call: sent offer to %s (%d candidates)",
++                _redact_id(contact_id),
++                sdp.count("a=candidate"),
++            )
++        except Exception:
++            logger.exception("SimpleX call: offer failed")
++            await self._call_cleanup()
++
++    async def _call_apply_answer(self, resp: dict) -> None:
++        """Apply the caller's WebRTC answer (bot is callee, sent the offer)."""
++        from aiortc import RTCSessionDescription
++        from lzstring import LZString
++
++        if self._call_pc is None:
++            return
++        answer = resp.get("callAnswer") or resp.get("answer") or {}
++        session_b64 = answer.get("rtcSession") or ""
++        if not session_b64:
++            logger.warning("SimpleX call: answer without rtcSession")
++            return
++        try:
++            raw = LZString.decompressFromBase64(session_b64)
++            obj = json.loads(raw)
++            sdp = obj.get("sdp", "")
++            desc = RTCSessionDescription(sdp=sdp, type="answer")
++            await self._call_pc.setRemoteDescription(desc)
++            logger.warning("SimpleX call: answer applied")
++            if self._call_audio_task is None:
++                self._call_audio_task = asyncio.create_task(
++                    self._call_audio_loop(self._call_contact_id)
++                )
++        except Exception:
++            logger.exception("SimpleX call: failed to apply answer")
++
++    async def _call_apply_ice(self, resp: dict) -> None:
++        """Apply trickle ICE candidates from the caller."""
++        from aiortc import RTCIceCandidate
++        from aiortc.sdp import candidate_from_sdp
++        from lzstring import LZString
++
++        if self._call_pc is None:
++            return
++        # NOTE: field is `extraInfo`, NOT `rtcExtraInfo`
++        extra = resp.get("callExtraInfo") or resp.get("extraInfo") or {}
++        cands_b64 = extra.get("rtcIceCandidates") or ""
++        if not cands_b64:
++            return
++        try:
++            raw = LZString.decompressFromBase64(cands_b64)
++            cands = json.loads(raw)
++            for c in cands:
++                cand_str = c.get("candidate", "")
++                if not cand_str:
++                    continue
++                parsed = candidate_from_sdp(cand_str)
++                parsed.sdpMid = c.get("sdpMid")
++                parsed.sdpMLineIndex = c.get("sdpMLineIndex")
++                await self._call_pc.addIceCandidate(parsed)
++            logger.warning("SimpleX call: applied %d ICE candidate(s)", len(cands))
++        except Exception:
++            logger.exception("SimpleX call: failed to apply ICE")
++
++    async def _call_end(self, resp: dict) -> None:
++        """Call ended (either side)."""
++        logger.warning("SimpleX call: ended")
++        await self._call_cleanup()
++
++    async def _call_cleanup(self) -> None:
++        """Tear down the peer connection and audio loop."""
++        if self._call_audio_task:
++            self._call_audio_task.cancel()
++            self._call_audio_task = None
++        if self._call_send_track:
++            self._call_send_track.stop()
++            self._call_send_track = None
++        if self._call_pc:
++            try:
++                await self._call_pc.close()
++            except Exception:
++                pass
++            self._call_pc = None
++        self._call_contact_id = None
++
++    # ------------------------------------------------------------------
++    # Native voice calls — Fase 2 (audio)
++    # ------------------------------------------------------------------
++
++    async def _call_audio_loop(self, contact_id: str) -> None:
++        """Inbound -> VAD -> STT -> LLM -> TTS -> outbound."""
++        st = {"speaking": False, "epoch": 0, "buf": [], "vad_silence": 0.0}
++        try:
++            await self._call_greeting(contact_id, st)
++            while True:
++                frame = await self._call_recv_frame()
++                if frame is None:
++                    await asyncio.sleep(0.01)
++                    continue
++                if st["speaking"]:
++                    # half-duplex: drop inbound while we speak (echo)
++                    st["buf"] = []
++                    st["vad_silence"] = 0.0
++                    continue
++                samples = self._call_frame_to_f32(frame)
++                if len(samples) == 0:
++                    continue
++                energy = float(np.sqrt(np.mean(samples ** 2)))
++                if energy >= _CALL_VAD_THRESHOLD:
++                    st["buf"].append(samples)
++                    st["vad_silence"] = 0.0
++                elif st["buf"]:
++                    st["vad_silence"] += len(samples) / _CALL_SR
++                    if st["vad_silence"] >= _CALL_VAD_END_SILENCE:
++                        await self._call_process_turn(contact_id, st)
++                        st["buf"] = []
++                        st["vad_silence"] = 0.0
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            logger.exception(
++                "SimpleX call: audio loop error for %s", _redact_id(contact_id)
++            )
++            await self._call_cleanup()
++
++    async def _call_recv_frame(self):
++        if not self._call_pc:
++            return None
++        try:
++            receivers = self._call_pc.getReceivers()
++            if not receivers:
++                return None
++            track = receivers[0].track
++            if track is None:
++                return None
++            return await track.recv()
++        except Exception:
++            return None
++
++    def _call_frame_to_f32(self, frame):
++        arr = frame.to_ndarray()
++        # Opus decodes to stereo interleaved int16 (1, 1920)
++        if arr.dtype == np.int16:
++            arr = arr.astype(np.float32) / 32768.0
++        else:
++            arr = arr.astype(np.float32)
++        if arr.ndim == 2:
++            arr = arr.mean(axis=1) if arr.shape[1] > 1 else arr.reshape(-1)
++        else:
++            arr = arr.reshape(-1)
++        frame_rate = getattr(frame, "sample_rate", _CALL_SR) or _CALL_SR
++        if frame_rate != _CALL_SR:
++            n_out = int(len(arr) * _CALL_SR / frame_rate)
++            if n_out > 1:
++                arr = np.interp(
++                    np.linspace(0.0, len(arr) - 1, n_out),
++                    np.arange(len(arr)),
++                    arr,
++                ).astype(np.float32)
++        return arr
++
++    async def _call_greeting(self, contact_id: str, st: dict) -> None:
++        try:
++            st["speaking"] = True
++            st["epoch"] += 1
++            my_epoch = st["epoch"]
++            text = os.getenv("SIMPLEX_CALL_GREETING", "Hi! How can I help?")
++            pcm = await self._call_tts(text)
++            logger.warning(
++                "SimpleX call: greeting TTS -> %d PCM bytes (%.2fs)",
++                len(pcm),
++                len(pcm) / (2 * _CALL_SEND_RATE),
++            )
++            if pcm and st["epoch"] == my_epoch:
++                self._call_send_track.push_pcm(pcm)
++                await asyncio.sleep(2.0)
++                try:
++                    stats = await self._call_pc.getStats()
++                    sent = 0
++                    for s in stats.values():
++                        if s.type == "outbound-rtp" and s.kind == "audio":
++                            sent = getattr(s, "packetsSent", 0)
++                    logger.warning(
++                        "SimpleX call: outbound-rtp packetsSent=%s", sent
++                    )
++                except Exception as _e:
++                    logger.warning("SimpleX call: getStats failed: %s", _e)
++        except Exception:
++            logger.exception("SimpleX call: greeting failed")
++        finally:
++            st["speaking"] = False
++
++    async def _call_process_turn(self, contact_id: str, st: dict) -> None:
++        st["speaking"] = True
++        st["epoch"] += 1
++        my_epoch = st["epoch"]
++        try:
++            pcm = np.concatenate(st["buf"]).astype(np.float32) if st["buf"] else None
++            if pcm is None or len(pcm) < int(_CALL_SR * _CALL_VAD_MIN_SPEECH):
++                return
++            text = await self._call_stt(pcm)
++            if not text:
++                return
++            logger.warning(
++                "SimpleX call: STT %r from %s", text, _redact_id(contact_id)
++            )
++            reply = await self._call_llm(text)
++            if not reply:
++                return
++            logger.warning("SimpleX call: LLM first phrase %r", reply[:60])
++            out_pcm = await self._call_tts(reply)
++            if out_pcm and st["epoch"] == my_epoch:
++                self._call_send_track.push_pcm(out_pcm)
++        except Exception:
++            logger.exception("SimpleX call: turn processing error")
++        finally:
++            st["speaking"] = False
++
++    async def _call_stt(self, pcm: np.ndarray) -> str:
++        import httpx
++
++        s16 = (np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
++        buf = io.BytesIO()
++        with wave.open(buf, "wb") as w:
++            w.setnchannels(1)
++            w.setsampwidth(2)
++            w.setframerate(_CALL_SR)
++            w.writeframes(s16.tobytes())
++        data = buf.getvalue()
++        async with httpx.AsyncClient(timeout=30.0) as client:
++            r = await client.post(
++                _CALL_STT_URL,
++                files={"file": ("audio.wav", data, "audio/wav")},
++                data={"model": _CALL_STT_MODEL, "language": _CALL_LANGUAGE},
++            )
++            r.raise_for_status()
++            js = r.json()
++            return js.get("text", "").strip()
++
++    async def _call_llm(self, text: str) -> str:
++        import httpx
++
++        url = os.getenv(
++            "SIMPLEX_CALL_LLM_URL", "https://api.deepseek.com/v1/chat/completions"
++        )
++        model = os.getenv("SIMPLEX_CALL_LLM_MODEL", "deepseek-chat")
++        api_key = os.getenv("SIMPLEX_CALL_LLM_API_KEY") or os.getenv(
++            "DEEPSEEK_API_KEY", ""
++        )
++        if not api_key:
++            try:
++                with open(os.path.expanduser("~/.hermes/.env")) as f:
++                    for line in f:
++                        line = line.strip()
++                        if line.startswith("DEEPSEEK_API_KEY="):
++                            api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
++                            break
++            except Exception:
++                pass
++        if not api_key:
++            logger.warning(
++                "SimpleX call: no LLM API key "
++                "(set SIMPLEX_CALL_LLM_API_KEY or DEEPSEEK_API_KEY)"
++            )
++            return ""
++        system = os.getenv(
++            "SIMPLEX_CALL_LLM_SYSTEM",
++            "You are a helpful voice assistant. Answer briefly and naturally.",
++        )
++        payload = {
++            "model": model,
++            "messages": [
++                {"role": "system", "content": system},
++                {"role": "user", "content": text},
++            ],
++            "max_tokens": 256,
++            "temperature": 0.7,
++        }
++        headers = {
++            "Content-Type": "application/json",
++            "Authorization": "Bearer %s" % api_key,
++        }
++        async with httpx.AsyncClient(timeout=30.0) as client:
++            r = await client.post(url, json=payload, headers=headers)
++            r.raise_for_status()
++            js = r.json()
++            return js["choices"][0]["message"]["content"].strip()
++
++    async def _call_tts(self, text: str) -> bytes:
++        import httpx
++
++        async with httpx.AsyncClient(timeout=60.0) as client:
++            r = await client.post(
++                _CALL_TTS_URL,
++                json={"text": text, "language": _CALL_LANGUAGE},
++            )
++            r.raise_for_status()
++            pcm_out = b""
++            for line in r.text.strip().splitlines():
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    js = json.loads(line)
++                except Exception:
++                    continue
++                audio_b64 = js.get("audio", "")
++                if not audio_b64:
++                    continue
++                wav_bytes = base64.b64decode(audio_b64)
++                pcm_out += self._wav_to_pcm48(wav_bytes)
++            return self._trim_silence(pcm_out)
++
++    def _trim_silence(
++        self, pcm: bytes, threshold: int = 500, min_gap: float = 0.35,
++        max_gap: float = 0.12,
++    ) -> bytes:
++        """Collapse long inter-word silences so speech sounds natural."""
++        if not pcm:
++            return pcm
++        try:
++            arr = np.frombuffer(pcm, dtype=np.int16)
++            is_sil = np.abs(arr) < threshold
++            sr = _CALL_SEND_RATE
++            out = []
++            n = len(arr)
++            i = 0
++            while i < n:
++                if not is_sil[i]:
++                    j = i
++                    while j < n and not is_sil[j]:
++                        j += 1
++                    out.append(arr[i:j])
++                    i = j
++                else:
++                    j = i
++                    while j < n and is_sil[j]:
++                        j += 1
++                    gap = (j - i) / sr
++                    if gap > min_gap:
++                        keep = int(max_gap * sr)
++                        out.append(arr[i : i + keep])
++                    else:
++                        out.append(arr[i:j])
++                    i = j
++            if not out:
++                return pcm
++            return np.concatenate(out).astype(np.int16).tobytes()
++        except Exception as e:
++            logger.warning("SimpleX call: trim silence failed: %s", e)
++            return pcm
++
++    def _wav_to_pcm48(self, wav_bytes: bytes) -> bytes:
++        try:
++            import av as _av
++
++            inp = _av.open(io.BytesIO(wav_bytes))
++            resampler = _av.AudioResampler(
++                format="s16", layout="mono", rate=_CALL_SEND_RATE
++            )
++            chunks = []
++            for frame in inp.decode(audio=0):
++                for rf in resampler.resample(frame):
++                    chunks.append(rf.to_ndarray().tobytes())
++            return b"".join(chunks)
++        except Exception as e:
++            logger.warning("SimpleX call: wav decode failed: %s", e)
++            return b""
++
+ 
+ # ---------------------------------------------------------------------------
+ # Plugin entry-point hooks

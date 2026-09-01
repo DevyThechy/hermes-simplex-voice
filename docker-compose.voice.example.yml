@@ -1,0 +1,38 @@
+# Reference voice backends for hermes-simplex-voice.
+#
+# These are examples. Any OpenAI-compatible STT and any JSONL TTS endpoint
+# work; the env vars in the README point at whatever you run.
+#
+# STT: speaches (faster-whisper behind the OpenAI transcription API).
+#   - Container listens on 8000; we publish it as host port 8003 because
+#     that is the adapter default.
+#   - Models are NOT auto-downloaded. After starting, run:
+#       curl -X POST http://127.0.0.1:8003/v1/models/Systran/faster-whisper-small
+#   - On a GPU host, swap the image for
+#     ghcr.io/speaches-ai/speaches:latest-cuda-12.6.3 and add the NVIDIA
+#     device reservations plus WHISPER__INFERENCE_DEVICE=cuda.
+#
+# TTS: stub. The adapter POSTs {"text": ..., "language": ...} and expects
+# newline-delimited JSON back, one {"audio": "<base64 wav>"} per line.
+# XTTS, Piper or any self-hosted TTS that can speak that contract works.
+services:
+  stt:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    container_name: speaches
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8003:8000"
+    environment:
+      - WHISPER__TTL=-1          # keep the model loaded
+    volumes:
+      - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
+
+  # tts:
+  #   image: your-tts-image
+  #   container_name: tts
+  #   restart: unless-stopped
+  #   ports:
+  #     - "127.0.0.1:5003:5003"
+
+volumes:
+  hf-hub-cache:
