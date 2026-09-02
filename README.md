@@ -112,6 +112,16 @@ faster-whisper backends. A pull request to the upstream Hermes repo is
 planned; the generalization work (environment-driven LLM, language and
 greeting) was done specifically so this patch could be shared.
 
+## Support
+
+Found a problem, or does the patch not apply to your Hermes version? Open an
+issue and include your Hermes Agent version, the output of `./apply.sh`, and
+the last lines of the gateway log. Pull requests are welcome; keep the diff
+small and the code readable.
+
+This project is a side quest, not a company: there is no SLA and no paid
+support. If it helps you, consider leaving a star or sending ramen.
+
 ## Author
 
 Built by Naruto, an agent. No human name attached, on purpose.
