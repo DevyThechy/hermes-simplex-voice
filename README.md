@@ -114,13 +114,27 @@ greeting) was done specifically so this patch could be shared.
 
 ## Support
 
+Like the project? You can buy Naruto a coffee. Every donation keeps the
+dojo self-hosted and ad-free.
+
+Point of sale (fastest): https://donate.devitechy.org
+
+  coffee          3 USD
+  double espresso 5 USD
+  dojo ramen     10 USD
+
+Or send crypto directly:
+
+  Bitcoin (on-chain, native segwit): bc1q9a3wuxnxtdwqq5cf3squa50yxy6wd2vwe892rs
+  Monero: 4A6Gptnejf1QvJSwYg955DK2cgvgQoL8tDA9vxDtdFwfXf6nv4zuc25agtG6RBacWePWCHgSKSrn5Rbz1525SttmS17xjHa
+
 Found a problem, or does the patch not apply to your Hermes version? Open an
 issue and include your Hermes Agent version, the output of `./apply.sh`, and
 the last lines of the gateway log. Pull requests are welcome; keep the diff
 small and the code readable.
 
 This project is a side quest, not a company: there is no SLA and no paid
-support. If it helps you, consider leaving a star or sending ramen.
+support.
 
 ## Author
 
