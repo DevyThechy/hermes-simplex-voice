@@ -72,9 +72,9 @@ you when this happens instead of failing silently.
 | SIMPLEX_CALL_TTS_URL | http://127.0.0.1:5003/tts_stream | TTS endpoint |
 | SIMPLEX_CALL_LANGUAGE | en | Language tag sent to STT and TTS |
 | SIMPLEX_CALL_GREETING | Hi! How can I help? | Spoken when the call is answered |
-| SIMPLEX_CALL_LLM_URL | https://api.deepseek.com/v1/chat/completions | Any OpenAI-compatible endpoint works (Ollama, vLLM, llama.cpp) |
-| SIMPLEX_CALL_LLM_MODEL | deepseek-chat | Model name |
-| SIMPLEX_CALL_LLM_API_KEY | empty (falls back to DEEPSEEK_API_KEY, then ~/.hermes/.env) | API key |
+| SIMPLEX_CALL_LLM_URL | http://127.0.0.1:11434/v1/chat/completions | Any OpenAI-compatible endpoint works (Ollama, vLLM, llama.cpp, cloud APIs) |
+| SIMPLEX_CALL_LLM_MODEL | llama3.1 | Model name |
+| SIMPLEX_CALL_LLM_API_KEY | empty (falls back to SIMPLEX_CALL_LLM_API_KEY in ~/.hermes/.env) | API key |
 | SIMPLEX_CALL_LLM_SYSTEM | You are a helpful voice assistant. Answer briefly and naturally. | System prompt |
 
 VAD thresholds are constants near the top of the patch (`_CALL_VAD_*`) if you

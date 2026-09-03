@@ -1,6 +1,8 @@
+diff --git a/plugins/platforms/simplex/adapter.py b/plugins/platforms/simplex/adapter.py
+index 979c1e6ea3..a4f9d4058c 100644
 --- a/plugins/platforms/simplex/adapter.py
 +++ b/plugins/platforms/simplex/adapter.py
-@@ -46,16 +46,24 @@
+@@ -46,16 +46,24 @@ is present, so the gateway will not attempt to instantiate the adapter.
  
  import asyncio
  import base64
@@ -22,10 +24,10 @@
 +import av
 +from aiortc.mediastreams import MediaStreamTrack, MediaStreamError
 +
- # Lazy import: BasePlatformAdapter and friends live in the main repo.
- # Imported at module top because they're stdlib-only inside Hermes — no
- # external dependency that would block the plugin from loading.
-@@ -81,6 +89,132 @@
+ from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+ from agent.secret_scope import get_secret as _scoped_get_secret
+ 
+@@ -103,6 +111,132 @@ HEALTH_CHECK_STALE_THRESHOLD = 300.0
  # Correlation ID prefix for requests we send so we can ignore our own echoes.
  _CORR_PREFIX = "hermes-"
  
@@ -158,7 +160,7 @@
  
  # ---------------------------------------------------------------------------
  # Helpers
-@@ -134,6 +268,49 @@
+@@ -156,6 +290,49 @@ def _is_audio_ext(ext: str) -> bool:
  # SimpleX Adapter
  # ---------------------------------------------------------------------------
  
@@ -208,7 +210,7 @@
  class SimplexAdapter(BasePlatformAdapter):
      """SimpleX Chat adapter using the simplex-chat daemon WebSocket API.
  
-@@ -197,6 +374,13 @@
+@@ -219,6 +396,13 @@ class SimplexAdapter(BasePlatformAdapter):
          self._pending_text_batches: Dict[str, MessageEvent] = {}
          self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
  
@@ -222,7 +224,7 @@
          logger.info(
              "SimpleX adapter initialized: url=%s auto_accept=%s groups=%s",
              self.ws_url,
-@@ -389,6 +573,11 @@
+@@ -411,6 +595,11 @@ class SimplexAdapter(BasePlatformAdapter):
          # into _pending_responses (e.g. fire-and-forget).
          if corr_id and isinstance(corr_id, str) and corr_id.startswith(_CORR_PREFIX):
              self._pending_corr_ids.discard(corr_id)
@@ -234,7 +236,7 @@
              return
  
          resp_type = resp.get("type") or event.get("type", "")
-@@ -468,6 +657,20 @@
+@@ -490,6 +679,20 @@ class SimplexAdapter(BasePlatformAdapter):
                          )
              return
  
@@ -255,7 +257,7 @@
          if resp_type:
              logger.debug("SimpleX: unhandled event type: %s", resp_type)
  
-@@ -1160,6 +1363,462 @@
+@@ -1182,6 +1385,459 @@ class SimplexAdapter(BasePlatformAdapter):
              return {"chat_id": chat_id, "type": "group", "name": chat_id[6:]}
          return {"chat_id": chat_id, "type": "dm", "name": chat_id}
  
@@ -589,32 +591,33 @@
 +        import httpx
 +
 +        url = os.getenv(
-+            "SIMPLEX_CALL_LLM_URL", "https://api.deepseek.com/v1/chat/completions"
++            "SIMPLEX_CALL_LLM_URL", "http://127.0.0.1:11434/v1/chat/completions"
 +        )
-+        model = os.getenv("SIMPLEX_CALL_LLM_MODEL", "deepseek-chat")
-+        api_key = os.getenv("SIMPLEX_CALL_LLM_API_KEY") or os.getenv(
-+            "DEEPSEEK_API_KEY", ""
-+        )
++        model = os.getenv("SIMPLEX_CALL_LLM_MODEL", "llama3.1")
++        api_key = os.getenv("SIMPLEX_CALL_LLM_API_KEY", "")
 +        if not api_key:
 +            try:
 +                with open(os.path.expanduser("~/.hermes/.env")) as f:
 +                    for line in f:
 +                        line = line.strip()
-+                        if line.startswith("DEEPSEEK_API_KEY="):
++                        if line.startswith("SIMPLEX_CALL_LLM_API_KEY="):
 +                            api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
 +                            break
 +            except Exception:
 +                pass
 +        if not api_key:
 +            logger.warning(
-+                "SimpleX call: no LLM API key "
-+                "(set SIMPLEX_CALL_LLM_API_KEY or DEEPSEEK_API_KEY)"
++                "SimpleX call: no LLM API key (set SIMPLEX_CALL_LLM_API_KEY)"
 +            )
 +            return ""
 +        system = os.getenv(
 +            "SIMPLEX_CALL_LLM_SYSTEM",
 +            "You are a helpful voice assistant. Answer briefly and naturally.",
 +        )
++        headers = {
++            "Content-Type": "application/json",
++            "Authorization": "Bearer %s" % api_key,
++        }
 +        payload = {
 +            "model": model,
 +            "messages": [
@@ -623,10 +626,6 @@
 +            ],
 +            "max_tokens": 256,
 +            "temperature": 0.7,
-+        }
-+        headers = {
-+            "Content-Type": "application/json",
-+            "Authorization": "Bearer %s" % api_key,
 +        }
 +        async with httpx.AsyncClient(timeout=30.0) as client:
 +            r = await client.post(url, json=payload, headers=headers)
