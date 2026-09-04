@@ -1,15 +1,16 @@
 diff --git a/plugins/platforms/simplex/adapter.py b/plugins/platforms/simplex/adapter.py
-index 979c1e6ea3..a4f9d4058c 100644
+index 4106683b21..c8306f6ab0 100644
 --- a/plugins/platforms/simplex/adapter.py
 +++ b/plugins/platforms/simplex/adapter.py
-@@ -46,16 +46,24 @@ is present, so the gateway will not attempt to instantiate the adapter.
+@@ -11,6 +11,7 @@ HERMES_SIMPLEX_TEXT_BATCH_DELAY (quiet seconds, default 0.8, merging rapid-fire
  
  import asyncio
  import base64
 +import io
+ import contextlib
  import json
  import logging
- import os
+@@ -18,10 +19,16 @@ import os
  import random
  import re
  import time
@@ -23,13 +24,12 @@ index 979c1e6ea3..a4f9d4058c 100644
 +
 +import av
 +from aiortc.mediastreams import MediaStreamTrack, MediaStreamError
-+
- from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
- from agent.secret_scope import get_secret as _scoped_get_secret
+ from urllib.parse import unquote
  
-@@ -103,6 +111,132 @@ HEALTH_CHECK_STALE_THRESHOLD = 300.0
- # Correlation ID prefix for requests we send so we can ignore our own echoes.
- _CORR_PREFIX = "hermes-"
+ from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+@@ -43,6 +50,131 @@ _TEXT_BEARING_TYPES = ("text", "file", "image", "voice", "link", "video")
+ _THUMB_URI_PREFIX = "data:image/jpg;base64,"
+ _MEDIA_KIND_PRECEDENCE = (("audio/", MessageType.VOICE), ("image/", MessageType.PHOTO))  # first match wins
  
 +# Native voice call audio pipeline constants
 +_CALL_SR = 16000          # STT/VAD sample rate
@@ -156,15 +156,13 @@ index 979c1e6ea3..a4f9d4058c 100644
 +            "SimpleX call: E2EE monkey-patch failed (unencrypted fallback)"
 +        )
 +        return False
-+
  
- # ---------------------------------------------------------------------------
- # Helpers
-@@ -156,6 +290,49 @@ def _is_audio_ext(ext: str) -> bool:
- # SimpleX Adapter
- # ---------------------------------------------------------------------------
+ def _parse_comma_list(value: str) -> List[str]:
+     return [v.strip() for v in value.split(",") if v.strip()]
+@@ -70,6 +202,46 @@ def _mime_for_ext(ext: str) -> str:
+         return f"audio/{ext.lstrip('.')}"
+     return "application/octet-stream"
  
-+
 +class _CallSendTrack(MediaStreamTrack):
 +    """Outbound audio track serving TTS PCM frames to the aiortc sender."""
 +
@@ -205,15 +203,14 @@ index 979c1e6ea3..a4f9d4058c 100644
 +            self._queue.put_nowait(None)
 +        except Exception:
 +            pass
-+
-+
- class SimplexAdapter(BasePlatformAdapter):
-     """SimpleX Chat adapter using the simplex-chat daemon WebSocket API.
  
-@@ -219,6 +396,13 @@ class SimplexAdapter(BasePlatformAdapter):
+ def _display_name(obj: dict, profile_key: str, default: str = "") -> str:
+     """``localDisplayName`` falling back to the nested profile's ``displayName``."""
+@@ -125,6 +297,14 @@ class SimplexAdapter(BasePlatformAdapter):
+         self._text_batch_delay = float(os.getenv("HERMES_SIMPLEX_TEXT_BATCH_DELAY", "0.8"))
          self._pending_text_batches: Dict[str, MessageEvent] = {}
          self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
- 
++
 +        # Native call state (SimpleX native voice calls)
 +        self._call_pc = None          # aiortc RTCPeerConnection
 +        self._call_contact_id = None  # contact id of the active call
@@ -223,23 +220,19 @@ index 979c1e6ea3..a4f9d4058c 100644
 +
          logger.info(
              "SimpleX adapter initialized: url=%s auto_accept=%s groups=%s",
-             self.ws_url,
-@@ -411,6 +595,11 @@ class SimplexAdapter(BasePlatformAdapter):
-         # into _pending_responses (e.g. fire-and-forget).
+             self.ws_url, self.auto_accept, "enabled" if self.group_allow_from else "disabled")
+@@ -230,8 +410,28 @@ class SimplexAdapter(BasePlatformAdapter):
+             return
          if corr_id and isinstance(corr_id, str) and corr_id.startswith(_CORR_PREFIX):
-             self._pending_corr_ids.discard(corr_id)
+             self._pending_corr_ids.discard(corr_id)  # our own un-awaited echo
 +            logger.warning(
 +                "SimpleX: daemon reply for %s: %s",
 +                corr_id,
 +                json.dumps(resp)[:400],
 +            )
              return
- 
          resp_type = resp.get("type") or event.get("type", "")
-@@ -490,6 +679,20 @@ class SimplexAdapter(BasePlatformAdapter):
-                         )
-             return
- 
++
 +        # Native call events (SimpleX native voice calls)
 +        if resp_type == "callInvitation":
 +            await self._call_handle_invitation(resp)
@@ -254,12 +247,12 @@ index 979c1e6ea3..a4f9d4058c 100644
 +            await self._call_end(resp)
 +            return
 +
-         if resp_type:
-             logger.debug("SimpleX: unhandled event type: %s", resp_type)
- 
-@@ -1182,6 +1385,459 @@ class SimplexAdapter(BasePlatformAdapter):
-             return {"chat_id": chat_id, "type": "group", "name": chat_id[6:]}
-         return {"chat_id": chat_id, "type": "dm", "name": chat_id}
+         handler = self._EVENT_HANDLERS.get(resp_type)
+         if handler is not None:
+             await handler(self, resp)
+@@ -582,6 +782,459 @@ class SimplexAdapter(BasePlatformAdapter):
+         is_group = chat_id.startswith("group:")
+         return {"chat_id": chat_id, "type": "group" if is_group else "dm", "name": chat_id[6:] if is_group else chat_id}
  
 +    # ------------------------------------------------------------------
 +    # Native voice calls — Fase 1 (signaling)
@@ -715,5 +708,5 @@ index 979c1e6ea3..a4f9d4058c 100644
 +            return b""
 +
  
- # ---------------------------------------------------------------------------
- # Plugin entry-point hooks
+ def check_requirements() -> bool:
+     """Plugin gate: require SIMPLEX_WS_URL AND the websockets package."""
